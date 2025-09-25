@@ -1,0 +1,430 @@
+/******************************************************
+ * MENÚ
+ ******************************************************/
+function onOpen(){
+  SpreadsheetApp.getUi().createMenu('RFID PRN (ZT411 203dpi)')
+    .addItem('Preparar borrador', 'prepareDraft_')
+    .addItem('Imprimir PRN desde borrador', 'printPrnFromDraft_')
+    .addSeparator()
+    .addItem('Descargar PRN (fila activa)', 'downloadPrnActiveRow')
+    .addToUi();
+}
+
+/******************************************************
+ * ENCABEZADOS (coinciden con hoja "Datos")
+ ******************************************************/
+const HEADERS = {
+  NOMBRE_MAT: 'Nombre del material',
+  MATERIAL:   'Material',
+  LOTE:       'Lote',
+  CE:         'Ce.',
+  UBIC:       'Ubicacion',  // no se imprime
+  CANT:       'Cantidad',
+  LARGO:      'Largo',
+  ALTO:       'Alto',
+  LETRA:      'Letra'       // opcional
+};
+
+/******************************************************
+ * LAYOUT GOLD — ZT411 (203 dpi)
+ * ^PW832 ^LL0207 ^PR2,2 ~SD18 ^RS8,B19,5,1,E
+ ******************************************************/
+const LAYOUT_411 = {
+  PW:  832,
+  LL:  207,
+  DARK: 25,
+  PR:  '1,0',
+  RS:  '8,17,5,1,E', // incluye verificación de escritura (E)
+  FONTS: {
+    TITLE:      { H: 45, W: 25 },
+    PC:         { H: 38, W: 38 },
+    LOTE_LABEL: { H: 23, W: 23 },
+    LOTE_VAL:   { H: 38, W: 38 },
+    LABEL_SM:   { H: 20, W: 20 },
+    VALUE_SM:   { H: 24, W: 24 }
+  },
+  Y: { TITULO: 115, LINEA2: 150, LINEA3: 185 },
+  X: {
+    TITULO: 90,
+    PC:     420,
+    LOTE_LABEL: 82,  LOTE_VAL: 135,
+    CTRO_LABEL: 82,  CTRO_VAL: 125,
+    NRO_LABEL:  165, NRO_VAL: 215,
+    LARGO_LABEL:275, LARGO_VAL: 330,
+    ALTO_LABEL: 445, ALTO_VAL: 490,
+    QR:         690
+  },
+  QR_Y:   200,
+  QR_MAG: 3,
+  QR_MODE:'LA'
+};
+
+/******************************************************
+ * UTILIDADES
+ ******************************************************/
+function getHeaderMap(sh){
+  const row1 = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(v=>String(v||'').trim());
+  const map = {};
+  for (const [k,name] of Object.entries(HEADERS)){
+    const idx = row1.indexOf(name);
+    if (idx === -1) throw new Error('Falta el encabezado: '+name);
+    map[k] = idx+1;
+  }
+  return map;
+}
+function escZPL(s){ return String(s||'').replace(/\\/g,'\\\\').replace(/\^/g,'\\^'); }
+function padRight(s,len,ch=' '){ s=String(s||''); return s.length>=len ? s.slice(0,len) : s + ch.repeat(len-s.length); }
+function padLeft (s,len,ch=' '){ s=String(s||''); return s.length>=len ? s.slice(-len) : ch.repeat(len-s.length) + s; }
+function toHexFromASCII(str){
+  return Array.from(String(str||''))
+    .map(c=>c.charCodeAt(0).toString(16).toUpperCase().padStart(2,'0'))
+    .join('');
+}
+function clamp01_99(n){
+  n = Number(n)||0;
+  if (n<0) n = 0;
+  if (n>99) n = 99;
+  return n;
+}
+function twoDigits(n){
+  const x = clamp01_99(n);
+  return x.toString().padStart(2,'0'); // para EPC sin letra
+}
+
+// Sanitizador SIN espacios; permite A-Z, 0-9, "/", "-", "_"
+function sanitizeEpcAscii(s){
+  return String(s||'')
+    .toUpperCase()
+    .replace(/ /g,'')             // elimina espacios
+    .replace(/[^A-Z0-9_\/-]/g,''); // sólo A-Z 0-9 _ / -
+}
+
+/******************************************************
+ * EPC estilo macro (30 BYTES totales)
+ *  - Prefijo fijo: 0x80002020 (4 bytes)
+ *  - Payload 26 bytes = LOTE(10) + MATERIAL(12) + PAR(2) + CE(2)
+ *    · LOTE  : left-pad a 10 (si excede, toma los últimos 10)
+ *    · MAT   : right-pad a 12 (si excede, toma los primeros 12)
+ *    · PAR(2): con letra → LETRA + última cifra NRO ; sin letra → NRO (00..99)
+ *    · CE(2) : pad con '0' a la izquierda
+ *  - SIN separador entre LOTE y MATERIAL
+ ******************************************************/
+function buildEpcHex_likeMacro({LOTE, MATERIAL, LETRA, NRO, CE}){
+  const prefixHex = '80002020';
+
+  const loteSan = sanitizeEpcAscii(LOTE);
+  const matSan  = sanitizeEpcAscii(MATERIAL);
+
+  const lote10 = padLeft (loteSan, 10, ' ');
+  const mat12  = padRight(matSan, 12, ' ');
+
+  const letra = (String(LETRA||'').trim().toUpperCase().charAt(0) || '');
+  const nro2  = twoDigits(NRO);
+  const par2  = letra ? (letra + nro2.slice(-1)) : nro2;
+
+  const ce2   = padLeft(String(CE||''), 2, '0');
+
+  const payload26 = lote10 + mat12 + par2 + ce2;
+
+  return (prefixHex + toHexFromASCII(payload26)).toUpperCase();
+}
+
+/******************************************************
+ * TEXTO DEL QR
+ ******************************************************/
+function buildQRText(d){
+  return `PC:${d.MATERIAL};Nom:${d.NOMBRE_MAT};Lot:${d.LOTE};Ctro:${d.CE};Nro:${d.NRO_IMP}`;
+}
+
+/******************************************************
+ * ZPL (UNA etiqueta) — layout gold ZT411
+ ******************************************************/
+function buildZPL_411(d){
+  const Z = LAYOUT_411, X = Z.X, Y = Z.Y, F = Z.FONTS;
+
+  const head = `^XA
+~TA000
+^MMF
+^PW${Z.PW}
+^LL0${Z.LL.toString().padStart(3,'0')}
+^LS0
+^CI0
+^PR${Z.PR}
+~SD${Z.DARK}
+^LH0,0
+^RS${Z.RS}`;
+
+  const linea1 = `^FT${X.TITULO},${Y.TITULO}^A0N,${F.TITLE.H},${F.TITLE.W}^FH\\^FD${escZPL(d.NOMBRE_MAT)}^FS`;
+
+  const linea2 = [
+    `^FR^FT${X.PC},${Y.LINEA2}^A0N,${F.PC.H},${F.PC.W}^FH\\^FD${escZPL(d.MATERIAL)}^FS`,
+    `^FT${X.PC},${Y.LINEA2}^A0N,${F.PC.H},${F.PC.W}^FH\\^FD${escZPL(d.MATERIAL)}^FS`,
+    `^FT${X.LOTE_LABEL},${Y.LINEA2}^A0N,${F.LOTE_LABEL.H},${F.LOTE_LABEL.W}^FH\\^FDLote:^FS`,
+    `^FT${X.LOTE_VAL},${Y.LINEA2}^A0N,${F.LOTE_VAL.H},${F.LOTE_VAL.W}^FH\\^FD${escZPL(d.LOTE)}^FS`
+  ].join('\n');
+
+  const linea3 = [
+    `^FT${X.CTRO_LABEL},${Y.LINEA3}^A0N,${F.LABEL_SM.H},${F.LABEL_SM.W}^FH\\^FDCtro:^FS`,
+    `^FT${X.CTRO_VAL},${Y.LINEA3}^A0N,${F.VALUE_SM.H},${F.VALUE_SM.W}^FH\\^FD${escZPL(d.CE)}^FS`,
+    `^FT${X.NRO_LABEL},${Y.LINEA3}^A0N,${F.LABEL_SM.H},${F.LABEL_SM.W}^FH\\^FDNro:^FS`,
+    `^FT${X.NRO_VAL},${Y.LINEA3}^A0N,${F.VALUE_SM.H},${F.VALUE_SM.W}^FH\\^FD${escZPL(d.NRO_IMP)}^FS`,
+    `^FT${X.LARGO_LABEL},${Y.LINEA3}^A0N,${F.LABEL_SM.H},${F.LABEL_SM.W}^FH\\^FDLargo:^FS`,
+    `^FT${X.LARGO_VAL},${Y.LINEA3}^A0N,${F.VALUE_SM.H},${F.VALUE_SM.W}^FH\\^FD${escZPL(d.LARGO)}^FS`,
+    `^FT${X.ALTO_LABEL},${Y.LINEA3}^A0N,${F.LABEL_SM.H},${F.LABEL_SM.W}^FH\\^FDAlto:^FS`,
+    `^FT${X.ALTO_VAL},${Y.LINEA3}^A0N,${F.VALUE_SM.H},${F.VALUE_SM.W}^FH\\^FD${escZPL(d.ALTO)}^FS`
+  ].join('\n');
+
+  const qrText = buildQRText(d);
+  const qr = `^FT${X.QR},${Z.QR_Y}^BQN,2,${Z.QR_MAG}^FH\\^FD${Z.QR_MODE},${escZPL(qrText)}^FS`;
+
+  // Escritura RFID (30 bytes) con verificación activa (^RS ... E)
+  const rfid = `^WVN
+^RFW,H,1,30,1^FD${d.EPC_HEX}^FS`;
+
+  const tail = `^PQ1,0,1,Y
+^XZ`;
+
+  return [head, linea1, linea2, linea3, qr, rfid, tail].join('\n');
+}
+
+/******************************************************
+ * DESCARGA .PRN
+ ******************************************************/
+function autoDownload(zplText, fileName){
+  const b64 = Utilities.base64Encode(Utilities.newBlob(zplText,'text/plain').getBytes());
+  const nameEsc = String(fileName||'etiqueta.prn').replace(/'/g,"\\'");
+  const html = HtmlService.createHtmlOutput(
+    `<html><body>
+      <script>
+        (function(){
+          var a=document.createElement('a');
+          a.href='data:text/plain;base64,${b64}';
+          a.download='${nameEsc}';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function(){ google.script.host.close(); }, 400);
+        })();
+      </script>
+      <p>Descargando PRN…</p>
+    </body></html>`
+  ).setWidth(220).setHeight(70);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Descargando PRN…');
+}
+
+/******************************************************
+ * HOJAS AUXILIARES
+ ******************************************************/
+function ensureSheet_(name, headers){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh){
+    sh = ss.insertSheet(name);
+    if (headers && headers.length){
+      sh.getRange(1,1,1,headers.length).setValues([headers]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
+
+/******************************************************
+ * PREPARAR BORRADOR (multi-filas, expande Cantidad)
+ * Editables: Letra (opcional) y Nro (0..99)
+ ******************************************************/
+function prepareDraft_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getActiveSheet();
+  const sel = sh.getActiveRange();
+  if (!sel){ SpreadsheetApp.getUi().alert('Selecciona filas en la hoja de Datos.'); return; }
+
+  const cols = getHeaderMap(sh);
+  const vals = sel.getValues();
+  const outRows = [];
+
+  vals.forEach((row,i)=>{
+    if (sel.getRow()+i === 1) return; // salta cabecera
+    const NOMBRE_MAT = row[cols.NOMBRE_MAT - 1];
+    const MATERIAL   = row[cols.MATERIAL   - 1];
+    const LOTE       = row[cols.LOTE       - 1];
+    const CE         = String(row[cols.CE  - 1]||'');
+    const LARGO      = row[cols.LARGO      - 1];
+    const ALTO       = row[cols.ALTO       - 1];
+    const CANT       = Math.max(1, Number(row[cols.CANT - 1]||1));
+    const LETRA_BASE = (String(row[cols.LETRA-1]||'').trim().toUpperCase().charAt(0) || ''); // opcional
+
+    if (!MATERIAL || !LOTE || CE==='') return;
+
+    for (let j=1;j<=CANT;j++){
+      outRows.push([
+        NOMBRE_MAT, MATERIAL, LOTE, CE, LARGO, ALTO,
+        LETRA_BASE, j, CANT  // Letra y Nro editables
+      ]);
+    }
+  });
+
+  if (!outRows.length){ SpreadsheetApp.getUi().alert('No hay datos válidos en la selección.'); return; }
+
+  const draft = ensureSheet_('Borrador', [
+    'Nombre del material','Material','Lote','Ce.','Largo','Alto',
+    'Letra (opcional)','Nro (0-99)','Total'
+  ]);
+
+  // limpia contenido previo (deja cabecera)
+  if (draft.getLastRow()>1) draft.getRange(2,1,draft.getLastRow()-1,draft.getLastColumn()).clearContent();
+
+  draft.getRange(2,1,outRows.length,9).setValues(outRows);
+
+  // Validaciones: Letra = 0 o 1 char A-Z; Nro = 0..99
+  const letraRange = draft.getRange(2,7,outRows.length,1);
+  const nroRange   = draft.getRange(2,8,outRows.length,1);
+  letraRange.setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireTextMatchesPattern('^[A-Z]?$')
+      .setAllowInvalid(false)
+      .build()
+  );
+  nroRange.setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireNumberBetween(0,99)
+      .setAllowInvalid(false)
+      .build()
+  );
+
+  // Formato número sin ceros a la izquierda (solo visual en Sheet)
+  nroRange.setNumberFormat('0');
+
+  SpreadsheetApp.getUi().alert(`✅ Borrador listo (${outRows.length} líneas). Edita "Letra" y "Nro (0-99)" y luego imprime.`);
+}
+
+/******************************************************
+ * IMPRIMIR DESDE BORRADOR
+ * - Descarga PRN, borra Borrador
+ * - Actualiza CONTADOR (total)
+ * - REGISTRO: resumen por (Material, Lote) con cantidad
+ ******************************************************/
+function printPrnFromDraft_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const draft = ss.getSheetByName('Borrador');
+  if (!draft){ SpreadsheetApp.getUi().alert('No existe la hoja "Borrador".'); return; }
+  const lr = draft.getLastRow();
+  if (lr < 2){ SpreadsheetApp.getUi().alert('La hoja "Borrador" está vacía.'); return; }
+
+  const data = draft.getRange(2,1,lr-1,9).getValues(); // 9 columnas
+  let zplAll = '';
+  let count  = 0;
+
+  // Resumen por par (Material, Lote)
+  const summary = new Map(); // key = MATERIAL|LOTE → {mat, lote, qty}
+
+  // Hoja de REGISTRO (resumen)
+  const regSh = ensureSheet_('Registro', ['FechaHora','Material','Lote','Impresas']);
+
+  data.forEach(r=>{
+    const NOMBRE_MAT = r[0], MATERIAL=r[1], LOTE=r[2];
+    const CE = String(r[3]||'');
+    const LARGO=r[4], ALTO=r[5];
+    const LETRA = (String(r[6]||'').trim().toUpperCase().charAt(0) || '');
+    const NRO   = clamp01_99(r[7]);
+    const TOTAL = Math.max(1, Number(r[8]||1));
+
+    if (!MATERIAL || !LOTE || CE==='') return;
+
+    // NRO_IMP (sin ceros a la izquierda)
+    const nroDisplay = String(NRO);
+    const nroImp = LETRA ? (LETRA + nroDisplay + '/' + TOTAL) : (nroDisplay + '/' + TOTAL);
+
+    const epcHex = buildEpcHex_likeMacro({ LOTE, MATERIAL, LETRA, NRO, CE });
+
+    zplAll += buildZPL_411({
+      NOMBRE_MAT, MATERIAL, LOTE, CE, LARGO, ALTO,
+      NRO_IMP: nroImp,
+      EPC_HEX: epcHex
+    }) + '\n';
+    count++;
+
+    const key = MATERIAL + '|' + LOTE;
+    const prev = summary.get(key) || { mat: MATERIAL, lote: LOTE, qty: 0 };
+    prev.qty += 1;
+    summary.set(key, prev);
+  });
+
+  if (!count){ SpreadsheetApp.getUi().alert('No hay líneas válidas para imprimir.'); return; }
+
+  autoDownload(zplAll, `PRN_${Date.now()}.prn`);
+
+  // Actualiza CONTADOR
+  const cntSh = ensureSheet_('Contador', ['Total_Impresas','Valor']);
+  let totalCell = cntSh.getRange(1,2);
+  let total = Number(totalCell.getValue()||0);
+  total += count;
+  cntSh.getRange(1,1).setValue('Total_Impresas');
+  totalCell.setValue(total);
+  if (cntSh.getLastRow()<3) cntSh.getRange(2,1,1,2).setValues([['FechaHora','Impresas']]).setFontWeight('bold');
+  cntSh.appendRow([new Date(), count]);
+
+  // REGISTRO (resumen por Material/Lote)
+  const now = new Date();
+  const rows = [];
+  for (const {mat,lote,qty} of summary.values()){
+    rows.push([now, mat, lote, qty]);
+  }
+  if (rows.length) regSh.getRange(regSh.getLastRow()+1,1,rows.length,4).setValues(rows);
+
+  // Limpia Borrador (deja la cabecera)
+  if (draft.getLastRow()>1){
+    draft.getRange(2,1,draft.getLastRow()-1,draft.getLastColumn()).clearContent();
+  }
+  SpreadsheetApp.getUi().alert(`✅ Impresas: ${count}. Borrador limpiado. Total acumulado: ${total}.`);
+}
+
+/******************************************************
+ * OPCIONAL — Fila activa → PRN directo (1..Cantidad)
+ * NRO_IMP sin ceros a la izquierda (con y sin letra)
+ ******************************************************/
+function downloadPrnActiveRow(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const r  = sh.getActiveCell().getRow();
+  if (r===1){ SpreadsheetApp.getUi().alert('Selecciona una fila con datos.'); return; }
+
+  const cols = getHeaderMap(sh);
+  const row  = sh.getRange(r,1,1,sh.getLastColumn()).getValues()[0];
+
+  const data = {
+    NOMBRE_MAT: row[cols.NOMBRE_MAT-1],
+    MATERIAL:   row[cols.MATERIAL-1],
+    LOTE:       row[cols.LOTE-1],
+    CE:         String(row[cols.CE-1]||''),
+    CANT:       Math.max(1, Number(row[cols.CANT-1]||1)),
+    LARGO:      row[cols.LARGO-1],
+    ALTO:       row[cols.ALTO-1],
+    LETRA:      (String(row[cols.LETRA-1]||'').trim().toUpperCase().charAt(0) || '')
+  };
+
+  if (!data.MATERIAL || !data.LOTE || data.CE===''){
+    SpreadsheetApp.getUi().alert('Completa al menos: Material, Lote y Ce.'); return;
+  }
+
+  let zpl = '';
+  for (let i=1;i<=data.CANT;i++){
+    const nro = clamp01_99(i);
+    const nroDisplay = String(nro);
+    const nroImp = data.LETRA ? (data.LETRA + nroDisplay + '/' + data.CANT)
+                              : (nroDisplay + '/' + data.CANT);
+
+    const epcHex = buildEpcHex_likeMacro({
+      LOTE: data.LOTE, MATERIAL: data.MATERIAL, LETRA: data.LETRA, NRO: nro, CE: data.CE
+    });
+    zpl += buildZPL_411({
+      NOMBRE_MAT: data.NOMBRE_MAT,
+      MATERIAL:   data.MATERIAL,
+      LOTE:       data.LOTE,
+      CE:         data.CE,
+      LARGO:      data.LARGO,
+      ALTO:       data.ALTO,
+      NRO_IMP:    nroImp,
+      EPC_HEX:    epcHex
+    }) + '\n';
+  }
+
+  autoDownload(zpl, `PRN_${String(data.MATERIAL).replace(/\W+/g,'-')}_${String(data.LOTE).replace(/\W+/g,'-')}.prn`);
+}
